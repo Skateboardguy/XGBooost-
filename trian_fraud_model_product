@@ -1,1 +1,304 @@
+我會先把你這支驗證版拆成「哪些可保留、哪些要移出正式版、正式版還需要補什麼」三類來看。你的問題不是單純註解掉 print，而是要把「模型驗證」和「正式訓練部署」拆乾淨。
 
+已思考 10s
+
+不是只把 Debug 語法註解掉而已。正式上線版建議拆成兩支：
+
+1. train_fraud_model_validation.py   # 模型驗證版
+2. train_fraud_model_production.py   # 正式訓練版
+
+你現在附件這支比較像「驗證 + Debug + 產名單」混在一起的版本，裡面有 PR Curve、classification_report、不同 threshold、輸出交易名單、再讀回 pkl 檢查等流程。這些適合驗證版，不適合正式訓練版。你的檔案目前確實包含大量 threshold 評估、PR Curve 繪圖、classification report 與名單匯出邏輯。
+
+正式版建議這樣改：
+
+正式版只做：
+1. 讀取特徵資料
+2. 使用 2025/07~2026/01 全部已標註資料
+3. prepare_xy()
+4. imputer.fit_transform()
+5. model.fit()
+6. joblib.dump()
+7. feature_importance.to_csv()
+
+不需要：
+
+1. split_date 切 train/test
+2. y_test / test_prob
+3. PR Curve
+4. Confusion Matrix
+5. classification_report
+6. threshold loop
+7. model_list_df.to_excel()
+8. 再 joblib.load 回來檢查
+9. plt.show()
+
+你目前 joblib.dump() 裡有 y_train、train_prob、y_test、test_prob、X_test、test_meta、train_meta，這些是 Notebook Debug 很好用，但 production model 不需要全部存。
+
+正式版 joblib.dump() 建議只留：
+
+joblib.dump(
+    {
+        "model": model,
+        "imputer": imputer,
+        "features": X_train_imputed.columns.to_list(),
+        "train_period": "2025-07~2026-01",
+        "model_version": "production_202507_202601",
+        "label_window": "2026-02~2026-04",
+        "scale_pos_weight": scale_pos_weight,
+    },
+    base_dir / ".cache" / "hawkeye_xgb_model_production.pkl"
+)
+
+如果你要上線產名單，應該另外寫一支：
+
+score_hawkeye_model.py
+
+專門做：
+
+1. load hawkeye_xgb_model_production.pkl
+2. 讀入新月份交易資料
+3. 套同樣 feature engineering
+4. imputer.transform()
+5. model.predict_proba()
+6. 依 threshold 或 TopN 輸出名單
+
+一句話：
+
+驗證版：證明模型有效
+正式訓練版：產出乾淨模型.pkl
+評分版：用模型對新資料產名單
+
+你現在這支不要直接當 production；它是很好的驗證版，但正式部署要拆乾淨。
+
+
+你目前這支應保留為：
+
+train_fraud_model_validation.py
+
+因為它已經包含：
+
+AUC
+KS
+PR Curve
+Top N
+Threshold分析
+Feature Importance
+Debug Meta Data
+
+未來模型重驗證一定還會用到。
+
+一、正式訓練版
+train_fraud_model_production.py
+
+核心改動：
+
+移除
+split_date
+train_df
+test_df
+
+改成：
+
+train_df = df.copy()
+移除
+roc_auc_score()
+calc_ks()
+confusion_matrix()
+classification_report()
+precision_recall_curve()
+移除
+for threshold in [...]
+
+全部區塊
+
+移除
+plt.plot()
+plt.show()
+移除
+model_list_df
+acct_list_df
+to_excel()
+保留
+prepare_xy()
+split_and_impute()
+reduce_memory_usage()
+Production Main
+df = find_main_table(tables)
+
+X_train, y_train = prepare_xy(df)
+
+X_train_imputed, _, imputer = split_and_impute(
+    X_train,
+    X_train.iloc[:1]
+)
+
+pos_count = (y_train == 1).sum()
+neg_count = (y_train == 0).sum()
+
+scale_pos_weight = neg_count / pos_count
+
+model = XGBClassifier(
+    ...
+)
+
+model.fit(
+    X_train_imputed,
+    y_train
+)
+Production Dump
+joblib.dump(
+{
+    "model": model,
+    "imputer": imputer,
+    "features": X_train_imputed.columns.tolist(),
+
+    "train_period":
+        "2025-07~2026-01",
+
+    "label_window":
+        "2026-02~2026-04",
+
+    "scale_pos_weight":
+        scale_pos_weight,
+
+    "model_version":
+        "v202506_production"
+},
+MODEL_PATH
+)
+二、評分版
+score_hawkeye_model.py
+
+用途：
+
+2026/02資料進來
+↓
+讀正式模型
+↓
+產名單
+Step1
+
+Load Model
+
+import joblib
+
+model_obj = joblib.load(
+    MODEL_PATH
+)
+
+model = model_obj["model"]
+imputer = model_obj["imputer"]
+features = model_obj["features"]
+Step2
+
+讀新資料
+
+例如：
+
+with open(
+    SCORE_PKL,
+    "rb"
+) as f:
+
+    tables = pickle.load(f)
+
+df = tables["特徵"]
+Step3
+
+保留模型欄位
+
+X = df[features].copy()
+Step4
+
+補值
+
+X_imputed = pd.DataFrame(
+    imputer.transform(X),
+    columns=features
+)
+Step5
+
+計算機率
+
+df["fraud_prob"] = (
+    model.predict_proba(X_imputed)
+    [:,1]
+)
+Step6
+
+排序
+
+df = df.sort_values(
+    "fraud_prob",
+    ascending=False
+)
+Step7
+
+產交易名單
+
+threshold = 0.8
+
+tx_list = df[
+    df["fraud_prob"] >= threshold
+]
+Step8
+
+帳戶歸戶
+
+acct_list = (
+    tx_list
+    .sort_values(
+        "fraud_prob",
+        ascending=False
+    )
+    .groupby(
+        "帳號",
+        as_index=False
+    )
+    .first()
+)
+Step9
+
+輸出
+
+tx_list.to_excel(
+    "交易資訊模型名單.xlsx",
+    index=False
+)
+
+acct_list.to_excel(
+    "帳戶資訊模型名單.xlsx",
+    index=False
+)
+未來實際流程
+模型驗證
+train_fraud_model_validation.py
+
+用途：
+
+AUC
+KS
+PR Curve
+Top N
+報告
+正式訓練
+train_fraud_model_production.py
+
+用途：
+
+2025/07~2026/01
+全部訓練
+
+輸出：
+
+hawkeye_xgb_model_production.pkl
+產名單
+score_hawkeye_model.py
+
+用途：
+
+2026/02交易資料
+↓
+產模型名單
+
+這樣會是銀行正式部署最接近的架構。
